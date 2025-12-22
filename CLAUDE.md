@@ -4,7 +4,7 @@ This file contains technical details, architectural decisions, and important imp
 
 ## Project Overview
 
-LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively answer user questions. The key innovation is anonymized peer review in Stage 2, preventing models from playing favorites.
+LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively answer user questions. The key innovation is anonymized peer review in Stage 2, preventing models from playing favorites. The system supports multi-turn conversations, maintaining context across multiple exchanges.
 
 ## Architecture
 
@@ -23,16 +23,26 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - Graceful degradation: returns None on failure, continues with successful responses
 
 **`council.py`** - The Core Logic
-- `stage1_collect_responses()`: Parallel queries to all council models
+- `compact_conversation_history()`: Summarizes old messages to prevent token limit issues in long conversations
+  - Keeps recent N messages in full detail
+  - Summarizes older messages into a brief context using gemini-2.5-flash
+  - Returns compacted message list for efficient processing
+- `stage1_collect_responses()`: Parallel queries to all council models with conversation history
+  - Auto-compacts history if >10 messages
 - `stage2_collect_rankings()`:
   - Anonymizes responses as "Response A, B, C, etc."
   - Creates `label_to_model` mapping for de-anonymization
   - Prompts models to evaluate and rank (with strict format requirements)
+  - Includes conversation context in ranking prompts (auto-compacted if long)
   - Returns tuple: (rankings_list, label_to_model_dict)
   - Each ranking includes both raw text and `parsed_ranking` list
-- `stage3_synthesize_final()`: Chairman synthesizes from all responses + rankings
+- `stage3_synthesize_final()`: Chairman synthesizes from all responses + rankings with conversation context
+  - Limits conversation history to last N turns (configurable via MAX_HISTORY_FOR_CHAIRMAN)
+  - Uses extended timeout (180s) for complex synthesis
+  - Provides intelligent fallback (top-ranked response) if synthesis fails
 - `parse_ranking_from_text()`: Extracts "FINAL RANKING:" section, handles both numbered lists and plain format
 - `calculate_aggregate_rankings()`: Computes average rank position across all peer evaluations
+- `run_full_council()`: Main orchestrator that accepts message history and runs all 3 stages
 
 **`storage.py`**
 - JSON-based conversation storage in `data/conversations/`
@@ -42,7 +52,12 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 
 **`main.py`**
 - FastAPI app with CORS enabled for localhost:5173 and localhost:3000
+- `build_message_history()`: Helper function that extracts conversation history from storage
+  - Converts stored messages to OpenRouter-compatible format
+  - Uses only stage3 (final synthesized) responses for assistant messages to keep context focused
+  - Appends new user message to build complete history
 - POST `/api/conversations/{id}/message` returns metadata in addition to stages
+- POST `/api/conversations/{id}/message/stream` streams results progressively
 - Metadata includes: label_to_model mapping and aggregate_rankings
 
 ### Frontend Structure (`frontend/src/`)
@@ -79,6 +94,25 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - 12px padding on all markdown content to prevent cluttered appearance
 
 ## Key Design Decisions
+
+### Multi-Turn Conversation Support
+The system maintains conversation context across multiple exchanges:
+- All previous user and assistant messages are included when querying models
+- Assistant messages use only the stage3 (final synthesized) response for context, not all individual council responses
+- This keeps context focused while preserving the collaborative decision-making benefits
+- Stage 1, 2, and 3 prompts all include conversation history (compacted if needed)
+- Models can reference and build upon previous exchanges naturally
+
+### Token Management for Long Conversations
+To prevent token limit errors in extended conversations:
+- **Automatic compacting**: When conversation exceeds 10 messages, old history is automatically summarized
+- **Summarization**: Uses gemini-2.5-flash to create 2-3 sentence summaries of old context
+- **Recency bias**: Recent messages (last 5 turns) are always kept in full detail
+- **Stage-specific limits**:
+  - Stage 1 & 2: Compact if >10 messages, keep last 10 messages in full
+  - Stage 3 (Chairman): Limited to last 3 turns (configurable via `MAX_HISTORY_FOR_CHAIRMAN`)
+- **Extended timeout**: Chairman gets 180s timeout (vs 120s default) due to complex synthesis task
+- **Graceful fallback**: If chairman fails, returns top-ranked Stage 1 response instead of generic error
 
 ### Stage 2 Prompt Format
 The Stage 2 prompt is very specific to ensure parseable output:
@@ -148,19 +182,23 @@ Use `test_openrouter.py` to verify API connectivity and test different model ide
 ## Data Flow Summary
 
 ```
-User Query
+User Message + Conversation History
     ↓
-Stage 1: Parallel queries → [individual responses]
+Build Message History: Extract previous messages, use stage3 for assistant context
     ↓
-Stage 2: Anonymize → Parallel ranking queries → [evaluations + parsed rankings]
+Stage 1: Parallel queries with full history → [individual responses]
+    ↓
+Stage 2: Anonymize → Parallel ranking queries with history → [evaluations + parsed rankings]
     ↓
 Aggregate Rankings Calculation → [sorted by avg position]
     ↓
-Stage 3: Chairman synthesis with full context
+Stage 3: Chairman synthesis with full context (history + rankings)
     ↓
 Return: {stage1, stage2, stage3, metadata}
+    ↓
+Storage: Save complete message exchange
     ↓
 Frontend: Display with tabs + validation UI
 ```
 
-The entire flow is async/parallel where possible to minimize latency.
+The entire flow is async/parallel where possible to minimize latency. Multi-turn conversations maintain context by passing all previous exchanges to each stage.

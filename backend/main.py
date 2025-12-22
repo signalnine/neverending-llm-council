@@ -12,6 +12,44 @@ import asyncio
 from . import storage
 from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
 
+
+def build_message_history(conversation: Dict[str, Any], new_user_message: str) -> List[Dict[str, str]]:
+    """
+    Build message history for council models from conversation.
+    Uses only stage3 responses for assistant messages to keep context focused.
+
+    Args:
+        conversation: The conversation dict with messages
+        new_user_message: The new user message to append
+
+    Returns:
+        List of message dicts with 'role' and 'content' keys
+    """
+    messages = []
+
+    for msg in conversation["messages"]:
+        if msg["role"] == "user":
+            messages.append({
+                "role": "user",
+                "content": msg["content"]
+            })
+        elif msg["role"] == "assistant":
+            # Use the final synthesized answer (stage3) for assistant history
+            if msg.get("stage3") and msg["stage3"].get("response"):
+                messages.append({
+                    "role": "assistant",
+                    "content": msg["stage3"]["response"]
+                })
+
+    # Add the new user message
+    messages.append({
+        "role": "user",
+        "content": new_user_message
+    })
+
+    return messages
+
+
 app = FastAPI(title="LLM Council API")
 
 # Enable CORS for local development
@@ -93,7 +131,10 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
     # Check if this is the first message
     is_first_message = len(conversation["messages"]) == 0
 
-    # Add user message
+    # Build message history including the new message
+    messages = build_message_history(conversation, request.content)
+
+    # Add user message to storage
     storage.add_user_message(conversation_id, request.content)
 
     # If this is the first message, generate a title
@@ -101,9 +142,9 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         title = await generate_conversation_title(request.content)
         storage.update_conversation_title(conversation_id, title)
 
-    # Run the 3-stage council process
+    # Run the 3-stage council process with full conversation history
     stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
-        request.content
+        messages
     )
 
     # Add assistant message with all stages
@@ -139,6 +180,9 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
     async def event_generator():
         try:
+            # Build message history including the new message
+            messages = build_message_history(conversation, request.content)
+
             # Add user message
             storage.add_user_message(conversation_id, request.content)
 
@@ -149,18 +193,18 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
             # Stage 1: Collect responses
             yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
-            stage1_results = await stage1_collect_responses(request.content)
+            stage1_results = await stage1_collect_responses(messages)
             yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
 
             # Stage 2: Collect rankings
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
-            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
+            stage2_results, label_to_model = await stage2_collect_rankings(messages, stage1_results)
             aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
             yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
 
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+            stage3_result = await stage3_synthesize_final(messages, stage1_results, stage2_results)
             yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
 
             # Wait for title generation if it was started
